@@ -4,6 +4,8 @@
 # as published by Sam Hocevar. See the COPYING.WTFPL file for more details.
 
 defmodule SSHPTY do
+  require Logger
+
   @type ip_protocol :: :udp | :tcp
   @type port_number :: 0..65535
 
@@ -42,9 +44,12 @@ defmodule SSHPTY do
 
   def connect(pathname, credential) do
     address = :binary.bin_to_list pathname.address
-    port = pathname.protocol_params[:port]
+    port = pathname.protocol_params[:port] || 22
     username = :binary.bin_to_list credential[:username]
     password = :binary.bin_to_list credential[:password]
+
+    Logger.debug("Connecting to #{address}:#{port} "
+    <> "using #{username}/#{password}...")
 
     {:ok, connection} = :ssh.connect(address, port, [
       user: username,

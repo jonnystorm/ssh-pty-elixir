@@ -6,45 +6,9 @@
 defmodule SSHPTY do
   require Logger
 
-  @type ip_protocol :: :udp | :tcp
-  @type port_number :: 0..65535
-
-  defmodule Pathname do
-    defstruct address: nil, protocol: nil, protocol_params: nil
-
-    @type t :: %Pathname{
-      address: String.t,
-      protocol: OpenSSH.ip_protocol,
-      protocol_params: [port: OpenSSH.port_number]
-    }
-
-    def address(pathname) do
-      pathname.address
-    end
-    def address(pathname, value) do
-      %Pathname{pathname|address: value}
-    end
-
-    def protocol(pathname) do
-      pathname.protocol
-    end
-    def protocol(pathname, protocol, params) when is_list(params) do
-      %Pathname{pathname|protocol: protocol, protocol_params: params}
-    end
-  end
-  
-  def pathname(address) do
-    pathname(address, :tcp, [port: 22])
-  end 
-  def pathname(address, protocol, protocol_params) do
-    %Pathname{}
-    |> Pathname.address(address)
-    |> Pathname.protocol(protocol, protocol_params)
-  end 
-
   def connect(pathname, credential) do
-    address = :binary.bin_to_list pathname.address
-    port = pathname.protocol_params[:port] || 22
+    address = :binary.bin_to_list Pathname.address(pathname)
+    port = Pathname.protocol_params(pathname)[:port] || 22
     username = :binary.bin_to_list credential[:username]
     password = :binary.bin_to_list credential[:password]
 
@@ -64,7 +28,7 @@ defmodule SSHPTY do
     :ssh.close(connection)
   end
 
-  def get_shell(connection, timeout \\ 10000) do
+  def get_shell(connection, timeout \\ 10_000) do
     {:ok, cid} = :ssh_connection.session_channel(connection, timeout)
     :ssh_connection.ptty_alloc(connection, cid, [])
     :ssh_connection.shell(connection, cid)
@@ -101,7 +65,6 @@ defmodule SSHPTY do
     for command <- commands do
       case :ssh_connection.send(connection, channel, command <> "\r", 5000) do
         :ok ->
-          #{:ok, _} = receive_messages
           {:ok, result} = receive_messages
 
           {command, result}

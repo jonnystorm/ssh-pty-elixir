@@ -15,6 +15,8 @@ defmodule SSHPTY.Mixfile do
   end
 
   defp deps do
-    []
+    [
+      {:pathname_ex, git: "https://github.com/jonnystorm/pathname-elixir"}
+    ]
   end
 end

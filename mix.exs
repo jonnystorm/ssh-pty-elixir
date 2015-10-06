@@ -10,8 +10,21 @@ defmodule SSHPTY.Mixfile do
      deps: deps]
   end
 
-  def application do
+  defp get_applications(:prod) do
+    [
+      applications: [
+        :logger,
+        :ssh,
+        :pathname_ex
+      ]
+    ]
+  end
+  defp get_applications(_) do
     [applications: [:logger, :ssh]]
+  end
+
+  def application do
+    get_applications Mix.env
   end
 
   defp deps do

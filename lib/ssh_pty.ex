@@ -101,8 +101,7 @@ defmodule SSHPTY do
     _receive_messages ""
   end
 
-  @spec send([String.t], :ssh.ssh_connection_ref, :ssh.ssh_channel_id) :: [{String.t, String.t} | {:error, any}]
-  @spec send(String.t, :ssh.ssh_connection_ref, :ssh.ssh_channel_id) :: [{String.t, String.t} | {:error, any}]
+  @spec send([String.t] | String.t, :ssh.ssh_connection_ref, :ssh.ssh_channel_id) :: [{String.t, String.t} | {:error, any}]
   def send(commands, connection, channel) when is_list commands do
     for command <- commands do
       case :ssh_connection.send connection, channel, command <> "\r", 5000 do

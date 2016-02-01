@@ -74,10 +74,10 @@ defmodule SSHPTY do
     [username: username, password: password]
   end
 
-  defp _receive_messages(acc) do
+  defp _receive_messages(timeout, acc) do
     receive do
       {:ssh_cm, _, {:data, _, _, data}} ->
-        _receive_messages acc <> data
+        _receive_messages timeout, acc <> data
 
       {:ssh_cm, _, {:eof, _}} ->
         {:ok, acc}
@@ -92,17 +92,17 @@ defmodule SSHPTY do
         {:ok, acc}
 
     after
-      3_000 ->
+      timeout ->
         {:ok, acc}
     end
   end
 
-  defp receive_messages do
-    _receive_messages ""
+  defp receive_messages(timeout) do
+    _receive_messages timeout, ""
   end
 
-  defp get_result do
-    case receive_messages do
+  defp get_result(timeout) do
+    case receive_messages timeout do
       {:ok, result} ->
         result
 
@@ -112,19 +112,28 @@ defmodule SSHPTY do
   end
 
   @spec send([String.t] | String.t, :ssh.ssh_connection_ref, :ssh.ssh_channel_id) :: [{String.t, String.t} | {:error, any}]
-  def send(commands, connection, channel) when is_list commands do
+  def send(commands, connection, channel) do
+    send commands, connection, channel, 3000
+  end
+
+  @spec send([String.t] | String.t, :ssh.ssh_connection_ref, :ssh.ssh_channel_id, pos_integer) :: [{String.t, String.t} | {:error, any}]
+  def send(commands, connection, channel, timeout)
+      when is_list(commands) and is_integer(timeout) and timeout >= 0 do
+
     for command <- commands do
       case :ssh_connection.send connection, channel, command <> "\r", 5000 do
         :ok ->
-          {command, get_result}
+          {command, get_result timeout}
 
         {:error, cause} ->
           {:error, cause}
       end
     end
   end
-  def send(command, connection, channel) when is_binary command do
-    send [command], connection, channel
+  def send(command, connection, channel, timeout)
+      when is_binary(command) and is_integer(timeout) and timeout >= 0 do
+
+    send [command], connection, channel, timeout
   end
 end
 

@@ -1,89 +1,175 @@
-# Copyright © 2015 Jonathan Storm <the.jonathan.storm@gmail.com>
-# This work is free. You can redistribute it and/or modify it under the
-# terms of the Do What The Fuck You Want To Public License, Version 2,
-# as published by Sam Hocevar. See the COPYING.WTFPL file for more details.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 defmodule SSHPTY do
   require Logger
 
-  @type credential :: [{atom, String.t}]
+  @type session
+    :: %{ref: :ssh.connection_ref,
+         cid: :ssh.ssh_channel_id,
+       }
+
+  defp get_delimiter_by_family(4), do: "."
+  defp get_delimiter_by_family(6), do: ":"
 
   defp resolve_hostname(hostname) do
-    {:ok, {:hostent, _, _, :inet, 4, [address|_]}} =
+    result =
       hostname
-        |> :binary.bin_to_list
-        |> :inet.gethostbyname
+      |> :binary.bin_to_list
+      |> :inet.gethostbyname
 
-    address
-      |> :inet.ntoa
-      |> :binary.list_to_bin
-  end
+    with {:ok, {_, _, _, _, family, addresses}}
+           <- result
+    do
+      delimiter =
+        get_delimiter_by_family family
 
-  @spec connect(URI.t, credential) :: :ssh.ssh_connection_ref
-  def connect(%URI{scheme: "ssh", host: host, port: port}, credential) do
-    address =
-      host
-        |> resolve_hostname
-        |> :binary.bin_to_list
+      address_strings =
+        addresses
+        |> Enum.map(&Tuple.to_list/1)
+        |> Enum.map(&Enum.join(&1, delimiter))
 
-    port = port || 22
-    username = :binary.bin_to_list credential[:username]
-    args =
-      [ user: username,
-        silently_accept_hosts: true
-      ]
-
-    Logger.debug "Connecting to #{username}@#{address}:#{port}..."
-
-    if credential[:rsa_password] do
-      args =
-        args ++ [rsa_pass_phrase: :binary.bin_to_list credential[:rsa_password]]
+      {:ok, address_strings}
     end
+  end
 
-    if credential[:dsa_password] do
-      args =
-        args ++ [dsa_pass_phrase: :binary.bin_to_list credential[:dsa_password]]
+  @type credential :: Keyword.t
+  @type opts
+    :: [{:timeout, timeout}]
+     | nil
+
+  @type uri
+    :: %{scheme: String.t,
+         host: String.t,
+         port: 1..65535,
+       }
+
+  @spec connect(uri, credential, opts)
+    :: {:ok, session}
+     | {:error, any}
+  def connect(
+    %{scheme: "ssh", host: host, port: port0} = _uri,
+    credential,
+    opts \\ []
+  ) when is_binary(host)
+  do
+    with {:ok, addresses} <- resolve_hostname(host),
+
+         address_erl <-
+           addresses
+           |> List.first
+           |> :binary.bin_to_list,
+
+         port <- port0 || 22,
+
+         username_erl <-
+           credential
+           |> Keyword.fetch!(:username)
+           |> String.to_charlist,
+
+         :ok <-
+           Logger.debug("Connecting to #{username_erl}@#{address_erl}:#{port}..."),
+
+         and_then <-
+           fn (x, f) ->
+             if x,
+             do: f.(x),
+             else: x
+           end,
+
+         append_to <-
+           &Enum.concat(&2, List.wrap(&1)),
+
+         accrete_as <-
+           fn(acc, value, key) ->
+             [ &String.to_charlist/1,
+               &{key, &1},
+               &List.wrap/1,
+             ]
+             |> Enum.reduce(value, &and_then.(&2, &1))
+             |> append_to.(acc)
+           end,
+
+         accrete_cred_as <-
+           fn(acc, key, new_key) ->
+             accrete_as.(acc, credential[key], new_key)
+           end,
+
+         args <-
+           [ user: username_erl,
+             silently_accept_hosts: true,
+           ]
+           |> accrete_cred_as.(:password, :password),
+           #|> accrete_cred_as.(:rsa_password, :rsa_pass_phrase)
+           #|> accrete_cred_as.(:dsa_password, :dsa_pass_phrase)
+
+         timeout <-
+           Keyword.get(opts, :timeout, 5000),
+
+         {:ok, ref} <-
+           :ssh.connect(address_erl, port, args, timeout)
+    do
+      {:ok, %{ref: ref, cid: nil}}
     end
+  end
 
-    if credential[:password] do
-      args =
-        args ++ [password: :binary.bin_to_list credential[:password]]
+  @spec disconnect(session)
+    :: :ok
+     | {:error, any}
+  def disconnect(%{ref: ref} = _session),
+    do: :ssh.close(ref)
+
+  @spec get_shell(session, timeout)
+    :: {:ok, session}
+     | {:error, :closed|:timeout}
+  def get_shell(session, timeout \\ 10_000)
+
+  def get_shell(
+    %{ref: ref, cid: nil} = session,
+    timeout
+  ) do
+    with {:ok, cid} <-
+           :ssh_connection.session_channel(ref, timeout)
+    do
+      :ssh_connection.ptty_alloc(ref, cid, [])
+      :ssh_connection.shell(ref, cid)
+
+      {:ok, %{session|cid: cid}}
     end
-
-    {:ok, connection} = :ssh.connect address, port, args, 5000
-
-    connection
   end
 
-  @spec disconnect(:ssh.ssh_connection_ref) :: :ok
-  def disconnect(connection) do
-    :ssh.close connection
-  end
+  def get_shell(session, _timeout),
+    do: {:ok, session}
 
-  @spec get_shell(:ssh.ssh_connection_ref, pos_integer) :: :ssh.ssh_channel_id
-  def get_shell(connection, timeout \\ 10_000) do
-    {:ok, cid} = :ssh_connection.session_channel connection, timeout
-    :ssh_connection.ptty_alloc connection, cid, []
-    :ssh_connection.shell connection, cid
-
-    cid
-  end
-
-  @spec credential(String.t, String.t) :: credential
-  def credential(username, password) do
-    [username: username, password: password]
-  end
+  @spec credential(String.t, String.t)
+    :: credential
+  def credential(username, password),
+    do: [username: username, password: password]
 
   defp _receive_messages(timeout, acc) do
     receive do
       {:ssh_cm, _, {:data, _, _, data}} ->
-        _receive_messages timeout, acc <> data
+        _receive_messages(timeout, acc <> data)
 
       {:ssh_cm, _, {:eof, _}} ->
         {:ok, acc}
 
-      {:ssh_cm, _, {:exit_signal, _, exit_signal, error_msg, lang_string}} ->
-        {:exit_signal, {exit_signal, error_msg, lang_string}, acc}
+      { :ssh_cm, _,
+        { :exit_signal,
+          _,
+          exit_signal,
+          error_msg,
+          lang_string
+        }
+      } ->
+        { :exit_signal,
+          { exit_signal,
+            error_msg,
+            lang_string
+          },
+          acc
+        }
 
       {:ssh_cm, _, {:exit_status, _, exit_status}} ->
         {:ok, {:exit_status, exit_status}, acc}
@@ -97,43 +183,52 @@ defmodule SSHPTY do
     end
   end
 
-  defp receive_messages(timeout) do
-    _receive_messages timeout, ""
-  end
+  defp receive_messages(timeout),
+    do: _receive_messages(timeout, "")
 
   defp get_result(timeout) do
     case receive_messages timeout do
-      {:ok, result} ->
-        result
-
-      {:ok, _, result} ->
-        result
+      {:ok,    result} -> result
+      {:ok, _, result} -> result
     end
   end
 
-  @spec send([String.t] | String.t, :ssh.ssh_connection_ref, :ssh.ssh_channel_id) :: [{String.t, String.t} | {:error, any}]
-  def send(commands, connection, channel) do
-    send commands, connection, channel, 3000
-  end
+  @type command :: String.t
 
-  @spec send([String.t] | String.t, :ssh.ssh_connection_ref, :ssh.ssh_channel_id, pos_integer) :: [{String.t, String.t} | {:error, any}]
-  def send(commands, connection, channel, timeout)
-      when is_list(commands) and is_integer(timeout) and timeout >= 0 do
+  @spec send([command] | command, session)
+    :: [ {:ok, {command, String.t}}
+       | {:error, any}
+       ]
+  def send(commands, session),
+    do: send(commands, session, 3000)
 
+  @spec send([command] | command, session, timeout)
+    :: [ {:ok, {command, String.t}}
+       | {:error, any}
+       ]
+  def send(
+    commands,
+    %{ref: ref, cid: cid},
+    timeout
+  )   when is_list(commands)
+       and is_integer(timeout)
+       and timeout >= 0
+  do
     for command <- commands do
-      case :ssh_connection.send connection, channel, command <> "\r", 5000 do
+      result =
+        :ssh_connection.send(ref, cid, "#{command}\r", 5000)
+
+      case result do
         :ok ->
-          {command, get_result timeout}
+          {:ok, {command, get_result(timeout)}}
 
         {:error, cause} ->
           {:error, cause}
       end
     end
   end
-  def send(command, connection, channel, timeout)
-      when is_binary(command) and is_integer(timeout) and timeout >= 0 do
 
-    send [command], connection, channel, timeout
-  end
+  def send(command, session, timeout),
+    do: send([command], session, timeout)
 end
 

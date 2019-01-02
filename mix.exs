@@ -7,6 +7,24 @@ defmodule SSHPTY.MixProject do
       elixir: "~> 1.0",
       start_permanent: Mix.env == :prod,
       deps: deps(),
+      dialyzer: [
+        add_plt_apps: [
+          :logger,
+          :jds_math_ex,
+          :linear_ex,
+          :netaddr_ex,
+          :snmp_mib_ex,
+          :net_snmp_ex,
+          :poison,
+        ],
+        ignore_warnings: "dialyzer.ignore",
+        flags: [
+          :unmatched_returns,
+          :error_handling,
+          :race_conditions,
+          :underspecs,
+        ],
+      ],
     ]
   end
 
@@ -19,6 +37,9 @@ defmodule SSHPTY.MixProject do
   end
 
   defp deps do
-    []
+    [ { :netaddr_ex,
+        git: "https://gitlab.com/jonnystorm/netaddr-elixir.git"
+      },
+    ]
   end
 end

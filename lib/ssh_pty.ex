@@ -5,112 +5,161 @@
 defmodule SSHPTY do
   require Logger
 
-  @type session
-    :: %{ref: :ssh.connection_ref,
-         cid: :ssh.ssh_channel_id,
+  @type uri
+    :: %{scheme: String.t,
+         host:   String.t,
+         port:   1..65535 | nil,
        }
 
-  defp get_delimiter_by_family(4), do: "."
-  defp get_delimiter_by_family(6), do: ":"
+  @type credential
+    :: %{username: String.t}
 
-  defp resolve_hostname(hostname) do
-    result =
-      hostname
-      |> :binary.bin_to_list
-      |> :inet.gethostbyname
+  @type opts   :: [] | nil
+  @type expect :: Regex.t
 
-    with {:ok, {_, _, _, _, family, addresses}}
-           <- result
+  @type session
+    :: %{ref:      :ssh.connection_ref,
+         cid:      :ssh.ssh_channel_id,
+         expect:   expect,
+         greeting: String.t,
+       }
+
+  @doc """
+  Open an SSH connection.
+
+  Setting option `:scrub_ansi` to `true` removes ANSI
+  escape sequences from the output. This is the default.
+
+  ## Examples
+
+  iex> prompt = ~r/>|#/
+  iex> credential =
+  ...>   %{username: "user",
+  ...>     password: "pass",
+  ...>   }
+  iex> "ssh://192.0.2.1:2222"
+  ...> |> URI.parse
+  ...> |> SSHPTY.connect(credential, ~r/>|#/)
+  {:ok, %{cid: 0, ref: pid(0,100,0), greeting: "prompt>\r\n"}}
+  """
+  @spec connect(uri, credential, expect, opts)
+    :: {:ok, session}
+     | {:error, term}
+  def connect(uri, credential, expect, opts \\ [])
+
+  def connect(
+    %{scheme: "ssh", host: host, port: port0} = _uri,
+    %{username: username} = credential,
+    expect,
+    opts
+  )   when is_binary(host)
+       and is_list(opts)
+  do
+    port = port0 || 22
+
+    username_erl = String.to_charlist(username)
+    cred_to_arg  =
+      %{:password     => :password,
+      # :rsa_password => :rsa_pass_phrase,
+      # :dsa_password => :dsa_pass_phrase,
+      }
+
+    args =
+      credential
+      |> Map.take(Map.keys(cred_to_arg))
+      |> Enum.reduce([], fn({k, v}, acc) ->
+        if v do
+          {cred_to_arg[k], String.to_charlist(v)}
+          |> List.wrap
+          |> Enum.concat(acc)
+        else
+          acc
+        end
+      end)
+      |> Enum.concat(
+        [ user: username_erl,
+          silently_accept_hosts: true,
+        ]
+      )
+
+    check_expect =
+      fn
+        %Regex{}      -> :ok
+        <<_::binary>> -> :ok
+        e ->
+          {:error, {:einval, e}}
+      end
+
+    timeout0 = opts[:timeout]
+    timeout  =
+      if timeout0 != nil
+         and is_integer(timeout0)
+         and timeout0 > 0,
+          do: timeout0,
+        else: 5000
+
+    scrub_ansi =
+      if opts[:scrub_ansi] == false,
+        do: false,
+      else: true
+
+    with :ok <- check_expect.(expect),
+
+         {:ok, erl_addresses} <- resolve_hostname(host),
+
+         erl_address <- List.first(erl_addresses),
+
+         {:ok, netaddr} <-
+           NetAddr.erl_ip_to_netaddr(erl_address),
+
+         address <- NetAddr.address(netaddr),
+
+         :ok <- Logger.debug("Connecting to ssh://#{username}@#{address}:#{port}..."),
+
+         {:ok, ref} <-
+           :ssh.connect(erl_address, port, args, timeout),
+
+         {:ok, cid} <- get_shell(ref, timeout)
     do
-      delimiter =
-        get_delimiter_by_family family
+      session =
+        %{ref:        ref,
+          cid:        cid,
+          expect:     expect,
+          scrub_ansi: scrub_ansi,
+        }
 
-      address_strings =
-        addresses
-        |> Enum.map(&Tuple.to_list/1)
-        |> Enum.map(&Enum.join(&1, delimiter))
-
-      {:ok, address_strings}
+      with {:ok, greeting} <-
+             get_result(session, timeout),
+        do: {:ok, Map.put(session, :greeting, greeting)}
     end
   end
 
-  @type credential :: Keyword.t
-  @type opts
-    :: [{:timeout, timeout}]
-     | nil
+  defp resolve_hostname(hostname) do
+    with {:ok, {_, _, _, _, _, erl_addresses}} <-
+           hostname
+           |> String.to_charlist
+           |> :inet.gethostbyname,
 
-  @type uri
-    :: %{scheme: String.t,
-         host: String.t,
-         port: 1..65535,
-       }
+      do: {:ok, erl_addresses}
+  end
 
-  @spec connect(uri, credential, opts)
-    :: {:ok, session}
-     | {:error, any}
-  def connect(
-    %{scheme: "ssh", host: host, port: port0} = _uri,
-    credential,
-    opts \\ []
-  ) when is_binary(host)
-  do
-    with {:ok, addresses} <- resolve_hostname(host),
+  defp get_shell(ref, timeout) do
+    with {:ok, cid} <-
+           :ssh_connection.session_channel(ref, timeout),
 
-         address_erl <-
-           addresses
-           |> List.first
-           |> :binary.bin_to_list,
-
-         port <- port0 || 22,
-
-         username_erl <-
-           credential
-           |> Keyword.fetch!(:username)
-           |> String.to_charlist,
+         :success <-
+           :ssh_connection.ptty_alloc(ref, cid, []),
 
          :ok <-
-           Logger.debug("Connecting to #{username_erl}@#{address_erl}:#{port}..."),
-
-         and_then <-
-           fn (x, f) ->
-             if x,
-             do: f.(x),
-             else: x
-           end,
-
-         append_to <-
-           &Enum.concat(&2, List.wrap(&1)),
-
-         accrete_as <-
-           fn(acc, value, key) ->
-             [ &String.to_charlist/1,
-               &{key, &1},
-               &List.wrap/1,
-             ]
-             |> Enum.reduce(value, &and_then.(&2, &1))
-             |> append_to.(acc)
-           end,
-
-         accrete_cred_as <-
-           fn(acc, key, new_key) ->
-             accrete_as.(acc, credential[key], new_key)
-           end,
-
-         args <-
-           [ user: username_erl,
-             silently_accept_hosts: true,
-           ]
-           |> accrete_cred_as.(:password, :password),
-           #|> accrete_cred_as.(:rsa_password, :rsa_pass_phrase)
-           #|> accrete_cred_as.(:dsa_password, :dsa_pass_phrase)
-
-         timeout <-
-           Keyword.get(opts, :timeout, 5000),
-
-         {:ok, ref} <-
-           :ssh.connect(address_erl, port, args, timeout)
+           :ssh_connection.shell(ref, cid)
     do
-      {:ok, %{ref: ref, cid: nil}}
+      {:ok, cid}
+    else
+      :failure ->
+        {:error, :no_pty_or_shell}
+
+      {:error, _} = e ->
+        e
     end
   end
 
@@ -120,42 +169,21 @@ defmodule SSHPTY do
   def disconnect(%{ref: ref} = _session),
     do: :ssh.close(ref)
 
-  @spec get_shell(session, timeout)
-    :: {:ok, session}
-     | {:error, :closed|:timeout}
-  def get_shell(session, timeout \\ 10_000)
+  defp _receive_messages(session, timeout, acc) do
+    ref = session.ref
 
-  def get_shell(
-    %{ref: ref, cid: nil} = session,
-    timeout
-  ) do
-    with {:ok, cid} <-
-           :ssh_connection.session_channel(ref, timeout)
-    do
-      :ssh_connection.ptty_alloc(ref, cid, [])
-      :ssh_connection.shell(ref, cid)
-
-      {:ok, %{session|cid: cid}}
-    end
-  end
-
-  def get_shell(session, _timeout),
-    do: {:ok, session}
-
-  @spec credential(String.t, String.t)
-    :: credential
-  def credential(username, password),
-    do: [username: username, password: password]
-
-  defp _receive_messages(timeout, acc) do
     receive do
-      {:ssh_cm, _, {:data, _, _, data}} ->
-        _receive_messages(timeout, acc <> data)
+      {:ssh_cm, ^ref, {:data, _, _, data}} ->
+        if data =~ session.expect do
+          {:ok, acc <> data}
+        else
+          _receive_messages(session, timeout, acc <> data)
+        end
 
-      {:ssh_cm, _, {:eof, _}} ->
+      {:ssh_cm, ^ref, {:eof, _}} ->
         {:ok, acc}
 
-      { :ssh_cm, _,
+      { :ssh_cm, ^ref,
         { :exit_signal,
           _,
           exit_signal,
@@ -163,72 +191,149 @@ defmodule SSHPTY do
           lang_string
         }
       } ->
-        { :exit_signal,
-          { exit_signal,
+        { :error,
+          {:exit_signal,
+            exit_signal,
             error_msg,
-            lang_string
-          },
-          acc
+            lang_string,
+            acc
+          }
         }
 
-      {:ssh_cm, _, {:exit_status, _, exit_status}} ->
-        {:ok, {:exit_status, exit_status}, acc}
+      {:ssh_cm, ^ref, {:exit_status, _, exit_status}} ->
+        {:ok, {:exit_status, exit_status, acc}}
 
-      {:ssh_cm, _, {:closed, _}} ->
+      {:ssh_cm, ^ref, {:closed, _}} ->
         {:ok, acc}
 
     after
       timeout ->
-        {:ok, acc}
+        {:error, {:etimedout, acc}}
     end
   end
 
-  defp receive_messages(timeout),
-    do: _receive_messages(timeout, "")
+  defp receive_messages(session, timeout),
+    do: _receive_messages(session, timeout, "")
 
-  defp get_result(timeout) do
-    case receive_messages timeout do
-      {:ok,    result} -> result
-      {:ok, _, result} -> result
-    end
+  defp if_do(term, pairs) do
+    pairs
+    |> Enum.reduce(term, fn({condition, fun}, acc) ->
+      if condition, do: fun.(acc), else: acc
+    end)
   end
 
-  @type command :: String.t
-
-  @spec send([command] | command, session)
-    :: [ {:ok, {command, String.t}}
-       | {:error, any}
-       ]
-  def send(commands, session),
-    do: send(commands, session, 3000)
-
-  @spec send([command] | command, session, timeout)
-    :: [ {:ok, {command, String.t}}
-       | {:error, any}
-       ]
-  def send(
-    commands,
-    %{ref: ref, cid: cid},
-    timeout
-  )   when is_list(commands)
-       and is_integer(timeout)
-       and timeout >= 0
-  do
-    for command <- commands do
-      result =
-        :ssh_connection.send(ref, cid, "#{command}\r", 5000)
-
-      case result do
-        :ok ->
-          {:ok, {command, get_result(timeout)}}
-
-        {:error, cause} ->
-          {:error, cause}
+  defp get_result(session, timeout) do
+    scrub =
+      fn str ->
+        if_do(str, [
+            { session.scrub_ansi,
+              &scrub_ansi_escape_sequences/1
+            },
+          ]
+        )
       end
+
+    case receive_messages(session, timeout) do
+      {:ok, {_, _, buf0}} ->
+        {:ok, scrub.(buf0)}
+
+      {:ok, buf0} ->
+        {:ok, scrub.(buf0)}
+
+      {:error, {:etimedout, buf0}} ->
+        {:error, {:etimedout, scrub.(buf0)}}
+
+      {:error, {_, sig, msg, _, buf0}} ->
+        :ok = Logger.error("SSH ref #{session.ref} got exit signal #{sig}: #{msg}")
+
+        {:error, {:enotconn, scrub.(buf0)}}
     end
   end
 
-  def send(command, session, timeout),
-    do: send([command], session, timeout)
+  @type input  :: String.t
+  @type output :: String.t
+
+  @doc """
+  Send input and receive output.
+
+  Setting option `:naive` to `false` will abort all
+  remaining inputs when an error occurs. This is the
+  default behavior.
+
+  ## Examples
+
+  iex> SSHPTY.exchange("ls\r", session)
+  [{"ls\r", {:ok, "prompt$ ls\r\nstuff  things\r\n"}}]
+  """
+  @spec exchange([input]|input, session, opts)
+    :: [ {input, {:ok, output}}
+       | {input, {:error, term}}
+       ]
+  def exchange(inputs, session, opts \\ [])
+
+  def exchange(inputs, session, opts)
+      when is_list(inputs)
+       and is_list(opts)
+  do
+    naive =
+      if opts[:naive] == true,
+        do: true,
+      else: false
+
+    timeout0 = opts[:timeout]
+    timeout  =
+      if timeout0 != nil
+         and is_integer(timeout0)
+         and timeout0 > 0,
+          do: timeout0,
+        else: 3000
+
+    send_and_receive =
+      fn input ->
+        if is_binary(input) do
+          with :ok <-
+                 :ssh_connection.send(
+                   session.ref,
+                   session.cid,
+                   input,
+                   5000
+                 ),
+            do: get_result(session, timeout)
+        else
+          {:error, :einval}
+        end
+      end
+
+    Enum.reduce(inputs, [], fn
+      (input, []) ->
+        result = send_and_receive.(input)
+
+        [{input, result}]
+
+      (input, [last|_] = acc) ->
+        result =
+          case last do
+            {:ok, _} ->
+              send_and_receive.(input)
+
+            {:error, _} when naive == true ->
+              {:error, :ecanceled}
+          end
+
+        [{input, result}|acc]
+    end)
+  end
+
+  def exchange(input, session, timeout)
+      when is_binary(input),
+    do: exchange([input], session, timeout)
+
+  def scrub_ansi_escape_sequences(string)
+      when is_binary(string)
+  do
+    string
+    |> String.replace(~r"\e\[[0-9;]*[a-z]"i, "")
+    |> String.replace(~r"\e\]0;.*\a", "")  # term title
+  end
 end
 

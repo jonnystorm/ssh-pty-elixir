@@ -256,10 +256,6 @@ defmodule SSHPTY do
   @doc """
   Send input and receive output.
 
-  Setting option `:naive` to `false` will abort all
-  remaining inputs when an error occurs. This is the
-  default behavior.
-
   ## Examples
 
   iex> SSHPTY.exchange("ls\r", session)
@@ -275,11 +271,6 @@ defmodule SSHPTY do
       when is_list(inputs)
        and is_list(opts)
   do
-    naive =
-      if opts[:naive] == true,
-        do: true,
-      else: false
-
     timeout0 = opts[:timeout]
     timeout  =
       if timeout0 != nil
@@ -316,7 +307,7 @@ defmodule SSHPTY do
             {:ok, _} ->
               send_and_receive.(input)
 
-            {:error, _} when naive == true ->
+            {:error, _} ->
               {:error, :ecanceled}
           end
 

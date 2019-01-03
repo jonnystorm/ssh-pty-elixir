@@ -31,6 +31,7 @@ defmodule SSHPTY.MixProject do
   def application do
     [ extra_applications: [
         :logger,
+        :netaddr_ex,
         :ssh,
       ]
     ]

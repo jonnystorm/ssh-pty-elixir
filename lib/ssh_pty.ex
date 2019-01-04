@@ -24,6 +24,15 @@ defmodule SSHPTY do
          greeting: String.t,
        }
 
+  defp check_expect(term) do
+    case term do
+      %Regex{}      -> :ok
+      <<_::binary>> -> :ok
+      _ ->
+        {:error, {:einval, term}}
+    end
+  end
+
   @doc """
   Open an SSH connection.
 
@@ -32,15 +41,15 @@ defmodule SSHPTY do
 
   ## Examples
 
-  iex> prompt = ~r/>|#/
+  iex> prompt = ~r/^.*(>|#)$/m
   iex> credential =
   ...>   %{username: "user",
   ...>     password: "pass",
   ...>   }
   iex> "ssh://192.0.2.1:2222"
   ...> |> URI.parse
-  ...> |> SSHPTY.connect(credential, ~r/>|#/)
-  {:ok, %{cid: 0, ref: pid(0,100,0), greeting: "prompt>\r\n"}}
+  ...> |> SSHPTY.connect(credential, ~r/^.*(>|#)$/m)
+  {:ok, %{cid: 0, ref: pid(0,100,0), greeting: "prompt>"}}
   """
   @spec connect(uri, credential, expect, opts)
     :: {:ok, session}
@@ -82,28 +91,15 @@ defmodule SSHPTY do
         ]
       )
 
-    check_expect =
-      fn
-        %Regex{}      -> :ok
-        <<_::binary>> -> :ok
-        e ->
-          {:error, {:einval, e}}
-      end
-
-    timeout0 = opts[:timeout]
-    timeout  =
-      if timeout0 != nil
-         and is_integer(timeout0)
-         and timeout0 > 0,
-          do: timeout0,
-        else: 5000
+    timeout =
+      validate_non_zero_natural(opts[:timeout], 5000)
 
     scrub_ansi =
-      if opts[:scrub_ansi] == false,
-        do: false,
+      if is_boolean(opts[:scrub_ansi]),
+        do: opts[:scrub_ansi],
       else: true
 
-    with :ok <- check_expect.(expect),
+    with :ok <- check_expect(expect),
 
          {:ok, erl_addresses} <- resolve_hostname(host),
 
@@ -170,14 +166,51 @@ defmodule SSHPTY do
     do: :ssh.close(ref)
 
   defp _receive_messages(session, timeout, acc) do
+    # Instead of scrubbing only the latest data, we should
+    # probably scrub the data and acc, combined
+    #
+    # ```elixir
+    # next_acc = scrub.(acc <> data)
+    # ```
+    #
+    # which is insane. Will ANSI escape sequences really
+    # ever be split between two chunks of data? I have no
+    # idea, but I can't justify the polynomial time cost
+    # until I see cause to do so.
+    #
+    # Meanwhile, the "expect" pattern search is certainly
+    # polynomial, and I see no reasonable way to prevent
+    # this without a substantial loss of
+    # correctness/determinism or simplicity. Maybe there
+    # will be reason to amortize this cost in the future.
+    #
+    scrub_ansi_escape_sequences =
+      fn string ->
+        string
+        |> String.replace(~r"\e\[[0-9;]*[a-z]"i, "")
+        |> String.replace(~r"\e\]0;.*\a", "")  # term title
+      end
+
+    scrub =
+      fn str ->
+        if_do(str, [
+            { session[:scrub_ansi],
+              scrub_ansi_escape_sequences
+            },
+          ]
+        )
+      end
+
     ref = session.ref
 
     receive do
       {:ssh_cm, ^ref, {:data, _, _, data}} ->
-        if data =~ session.expect do
-          {:ok, acc <> data}
+        next_acc = acc <> scrub.(data)
+
+        if next_acc =~ session.expect do
+          {:ok, next_acc}
         else
-          _receive_messages(session, timeout, acc <> data)
+          _receive_messages(session, timeout, next_acc)
         end
 
       {:ssh_cm, ^ref, {:eof, _}} ->
@@ -223,32 +256,66 @@ defmodule SSHPTY do
   end
 
   defp get_result(session, timeout) do
-    scrub =
-      fn str ->
-        if_do(str, [
-            { session.scrub_ansi,
-              &scrub_ansi_escape_sequences/1
-            },
-          ]
-        )
-      end
-
     case receive_messages(session, timeout) do
-      {:ok, {_, _, buf0}} ->
-        {:ok, scrub.(buf0)}
-
-      {:ok, buf0} ->
-        {:ok, scrub.(buf0)}
-
-      {:error, {:etimedout, buf0}} ->
-        {:error, {:etimedout, scrub.(buf0)}}
-
-      {:error, {_, sig, msg, _, buf0}} ->
+      {:error, {_, sig, msg, _, buf}} ->
         :ok = Logger.error("SSH ref #{session.ref} got exit signal #{sig}: #{msg}")
 
-        {:error, {:enotconn, scrub.(buf0)}}
+        {:error, {:enotconn, buf}}
+
+      {:ok, {_, _, buf}} ->
+        {:ok, buf}
+
+      _ = r ->
+        r
     end
   end
+
+  defp validate_non_zero_natural(term, _default)
+      when is_integer(term)
+       and term > 0,
+  do: term
+
+  defp validate_non_zero_natural(_term, default),
+    do: default
+
+  defp _exchange(inputs, session, opts)
+      when is_list(inputs)
+  do
+    # We avoid frivolously hitting the network after
+    # encountering an error by returning `:ecanceled` as
+    # the result for all remaining inputs.
+    #
+    inputs
+    |> Enum.reduce([], fn
+      (input, []) ->
+        [_exchange(input, session, opts)]
+
+      (input, [last|_] = acc) ->
+        result =
+          case last do
+            {_, {:ok, _}} ->
+              _exchange(input, session, opts)
+
+            {_, {:error, _}} ->
+              {:error, :ecanceled}
+          end
+
+        [result|acc]
+    end)
+    |> Enum.reverse
+  end
+
+  defp _exchange(
+    input,
+    %{ref: ref, cid: cid} = session,
+    opts
+  )   when is_binary(input)
+  do
+    with :ok <-
+           :ssh_connection.send(ref, cid, input, 5000),
+      do: {input, get_result(session, opts[:timeout])}
+  end
+
 
   @type input  :: String.t
   @type output :: String.t
@@ -259,72 +326,42 @@ defmodule SSHPTY do
   ## Examples
 
   iex> SSHPTY.exchange("ls\r", session)
-  [{"ls\r", {:ok, "prompt$ ls\r\nstuff  things\r\n"}}]
+  {:ok, [{"ls\r", {:ok, "prompt$ ls\r\nstuff  things\r\n"}}]}
   """
-  @spec exchange([input]|input, session, opts)
-    :: [ {input, {:ok, output}}
-       | {input, {:error, term}}
-       ]
+  @spec exchange([input] | input, session, opts)
+    :: { :ok,
+         [ {input, {:ok, output}}
+         | {input, {:error, term}}
+         ]
+       } | {:error, term}
   def exchange(inputs, session, opts \\ [])
 
-  def exchange(inputs, session, opts)
-      when is_list(inputs)
-       and is_list(opts)
+  def exchange(
+    term,
+    %{ref: _, cid: _, expect: expect} = session,
+    opts0
+  )   when (
+        is_list(term)
+        or is_binary(term)
+      ) and is_list(opts0)
   do
-    timeout0 = opts[:timeout]
-    timeout  =
-      if timeout0 != nil
-         and is_integer(timeout0)
-         and timeout0 > 0,
-          do: timeout0,
-        else: 3000
+    timeout =
+      validate_non_zero_natural(opts0[:timeout], 3000)
 
-    send_and_receive =
-      fn input ->
-        if is_binary(input) do
-          with :ok <-
-                 :ssh_connection.send(
-                   session.ref,
-                   session.cid,
-                   input,
-                   5000
-                 ),
-            do: get_result(session, timeout)
-        else
-          {:error, :einval}
-        end
-      end
+    opts =
+      opts0
+      |> Keyword.put(:timeout, timeout)
 
-    Enum.reduce(inputs, [], fn
-      (input, []) ->
-        result = send_and_receive.(input)
-
-        [{input, result}]
-
-      (input, [last|_] = acc) ->
-        result =
-          case last do
-            {:ok, _} ->
-              send_and_receive.(input)
-
-            {:error, _} ->
-              {:error, :ecanceled}
-          end
-
-        [{input, result}|acc]
-    end)
+    with :ok <- check_expect(expect) do
+      { :ok,
+        term
+        |> _exchange(session, opts)
+        |> List.wrap
+      }
+    end
   end
 
-  def exchange(input, session, timeout)
-      when is_binary(input),
-    do: exchange([input], session, timeout)
-
-  def scrub_ansi_escape_sequences(string)
-      when is_binary(string)
-  do
-    string
-    |> String.replace(~r"\e\[[0-9;]*[a-z]"i, "")
-    |> String.replace(~r"\e\]0;.*\a", "")  # term title
-  end
+  def exchange(term, _session, _timeout),
+    do: {:error, {:einval, term}}
 end
 
